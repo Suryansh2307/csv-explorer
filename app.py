@@ -9,10 +9,12 @@ Run:  python app.py      (starts with no upload limit and the app's theme)
 """
 
 import io
-import hashlib
 import inspect
 import os
 import re
+import shutil
+import uuid
+import weakref
 import tempfile
 import time
 
@@ -176,26 +178,83 @@ _DL_PARAMS = inspect.signature(st.download_button).parameters
 DL_IGNORE = {"on_click": "ignore"} if "on_click" in _DL_PARAMS else {}
 
 
-@st.cache_resource
-def get_engine():
-    # A database file on disk (not RAM): handles files far bigger than memory.
-    for f in os.listdir(WORKDIR):  # clean up databases from earlier runs
-        if f.startswith("session_") and f.endswith((".duckdb", ".duckdb.wal")):
-            try:
-                os.remove(os.path.join(WORKDIR, f))
-            except OSError:
-                pass  # still in use by another running copy
-    db = os.path.join(WORKDIR, f"session_{os.getpid()}.duckdb")
-    con = duckdb.connect(db, config={"temp_directory": os.path.join(WORKDIR, "spill")})
-    return {"con": con, "version": 0}
+# ----------------------------------------------------------------------------
+# Private, per-session storage
+# ----------------------------------------------------------------------------
+# Every browser session gets its OWN folder + database. Nobody else using the app
+# (e.g. on Streamlit Cloud) can see or overwrite your data. The folder is deleted
+# when you click "Clear my data", when the session ends, and in any case after
+# STALE_HOURS without activity.
+STALE_HOURS = 6
+
+
+class Engine:
+    def __init__(self):
+        self.sid = uuid.uuid4().hex
+        self.dir = os.path.join(WORKDIR, f"s_{self.sid}")
+        os.makedirs(self.dir)
+        self.con = duckdb.connect(os.path.join(self.dir, "data.duckdb"),
+                                  config={"temp_directory": os.path.join(self.dir, "spill")})
+        self.version = 0
+        # Delete everything when this session is discarded by Streamlit.
+        self._finalizer = weakref.finalize(self, _destroy, self.con, self.dir)
+
+    def destroy(self):
+        self._finalizer()
+
+
+def _destroy(con_, folder):
+    try:
+        con_.close()
+    except Exception:  # noqa: BLE001
+        pass
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+def sweep_stale_storage():
+    """Remove leftovers of sessions that ended without cleaning up (and old builds' files)."""
+    cutoff = time.time() - STALE_HOURS * 3600
+    for name in os.listdir(WORKDIR):
+        p = os.path.join(WORKDIR, name)
+        try:
+            if os.path.getmtime(p) < cutoff or not name.startswith("s_"):
+                shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
+        except OSError:
+            pass
+
+
+def get_engine() -> Engine:
+    eng = st.session_state.get("_engine")
+    if eng is not None and not os.path.isdir(eng.dir):  # expired after long inactivity
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        eng = None
+    if eng is None:
+        sweep_stale_storage()
+        eng = Engine()
+        st.session_state["_engine"] = eng
+    try:
+        os.utime(eng.dir)  # mark as active so the sweep leaves it alone
+    except OSError:
+        pass
+    return eng
+
+
+def clear_my_data():
+    eng = st.session_state.get("_engine")
+    if eng is not None:
+        eng.destroy()
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    st.cache_data.clear()  # drop cached previews / counts from memory
 
 
 def con():
-    return get_engine()["con"].cursor()
+    return get_engine().con.cursor()
 
 
 def bump_version():
-    get_engine()["version"] += 1
+    get_engine().version += 1
 
 
 def qi(name) -> str:
@@ -212,7 +271,7 @@ def is_numeric(dtype: str) -> bool:
     return dtype.upper().startswith(NUMERIC_PREFIXES)
 
 
-@st.cache_data(show_spinner=False, max_entries=300)
+@st.cache_data(show_spinner=False, max_entries=300, ttl=3600)
 def _cached_query(sql: str, token: str) -> pd.DataFrame:
     return con().execute(sql).df()
 
@@ -250,23 +309,23 @@ def file_kind(path: str) -> str:
 
 
 def save_upload(up) -> str:
-    """Persist an uploaded file to disk so DuckDB can stream it."""
-    up.seek(0)
-    digest = hashlib.md5(up.read(1 << 20)).hexdigest()[:12]
+    """Write the upload to this session's private folder so DuckDB can stream it.
+    The copy is deleted as soon as loading finishes."""
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(up.name))
-    path = os.path.join(WORKDIR, f"{digest}_{up.size}_{safe}")
-    if not os.path.exists(path):
-        up.seek(0)
-        with open(path + ".part", "wb") as fh:
-            while chunk := up.read(64 << 20):
-                fh.write(chunk)
-        os.replace(path + ".part", path)
+    path = os.path.join(get_engine().dir, f"upload_{safe}")
+    up.seek(0)
+    with open(path, "wb") as fh:
+        while chunk := up.read(64 << 20):
+            fh.write(chunk)
     return path
 
 
-@st.cache_data(show_spinner=False)
-def excel_sheets(path: str, mtime: float):
-    return pd.ExcelFile(path).sheet_names
+def excel_sheets(up) -> list:
+    key = f"_sheets_{getattr(up, 'file_id', '')}_{up.name}_{up.size}"
+    if key not in st.session_state:
+        up.seek(0)
+        st.session_state[key] = pd.ExcelFile(up).sheet_names
+    return st.session_state[key]
 
 
 def dedupe(names):
@@ -365,8 +424,7 @@ def reset_widgets(prefix: str):
 
 
 def source_picker(prefix: str):
-    """File uploader + read options. Returns (path, opts)."""
-    path = None
+    """File uploader + read options. Returns (uploaded_file, opts)."""
     limit = st.get_option("server.maxUploadSize")
     if limit < UPLOAD_LIMIT_MB:
         st.warning(f"Upload limit is {limit} MB. To raise it: on your computer, start the app "
@@ -374,14 +432,12 @@ def source_picker(prefix: str):
                    "`.streamlit/config.toml` (from this project) at the **root of the GitHub "
                    "repo** and reboot the app.")
     up = st.file_uploader("Choose CSV / Excel / Parquet", type=FILE_TYPES, key=f"{prefix}_up")
-    if up is not None:
-        path = save_upload(up)
+    name = up.name if up is not None else None
 
-    opts = {"display_name": up.name if up is not None else None}
-    if path and file_kind(path) == "excel":
+    opts = {"display_name": name}
+    if name and file_kind(name) == "excel":
         try:
-            opts["sheet"] = st.selectbox("Sheet", excel_sheets(path, os.path.getmtime(path)),
-                                         key=f"{prefix}_sheet")
+            opts["sheet"] = st.selectbox("Sheet", excel_sheets(up), key=f"{prefix}_sheet")
         except Exception as e:  # noqa: BLE001
             st.error(f"Could not read workbook: {e}")
     with st.expander("Read options"):
@@ -389,7 +445,7 @@ def source_picker(prefix: str):
             "Read all columns as text", key=f"{prefix}_alltext",
             help="Safest: keeps leading zeros / IDs as-is and avoids type errors. "
                  "Sum / Average still work (text is converted to numbers on the fly).")
-        if not path or file_kind(path) == "csv":
+        if not name or file_kind(name) == "csv":
             opts["header"] = st.checkbox("First row is header", True, key=f"{prefix}_header")
             opts["delim"] = st.text_input("Delimiter (blank = auto, \\t = tab)", "",
                                           key=f"{prefix}_delim")
@@ -399,7 +455,7 @@ def source_picker(prefix: str):
             opts["full_scan"] = st.checkbox(
                 "Scan whole file to detect types (slower)", key=f"{prefix}_full",
                 help="Use if loading fails with a type-conversion error.")
-    return path, opts
+    return up, opts
 
 
 def do_load(table: str, path: str, opts: dict, state_key: str, widget_prefix: str):
@@ -476,7 +532,7 @@ def download_df(df: pd.DataFrame, name: str, key: str, index=False):
 def download_sql(sql: str, name: str, key: str, n_rows: int):
     """Download the full result of a (possibly huge) query, streamed via DuckDB."""
     def make_csv():
-        out = os.path.join(WORKDIR, f"{name}_{int(time.time())}.csv")
+        out = os.path.join(get_engine().dir, f"{name}_{int(time.time())}.csv")
         con().execute(f"COPY ({sql}) TO {ql(out)} (HEADER, DELIMITER ',')")
         with open(out, "rb") as fh:
             data = fh.read()
@@ -560,9 +616,21 @@ def filter_sidebar(cols: dict) -> str:
 with st.sidebar:
     st.title("📊 Big CSV Explorer")
     st.caption("Value counts · Pivots · Filters — for files of any size")
-    path, opts = source_picker("main")
-    if path and st.button("📂 Load data", type="primary", **FULL_BTN):
-        do_load("data", path, opts, "main_info", "w_")
+    up, opts = source_picker("main")
+    if up is not None and st.button("📂 Load data", type="primary", **FULL_BTN):
+        path = save_upload(up)
+        try:
+            do_load("data", path, opts, "main_info", "w_")
+        finally:
+            os.remove(path)  # the data now lives only in this session's private database
+    if st.session_state.get("main_info"):
+        if st.button("🗑️ Clear my data", **FULL_BTN,
+                     help="Deletes your data from the server now. Remove the file from "
+                          "the upload box too."):
+            clear_my_data()
+            st.rerun()
+    st.caption("🔒 Your data is private to this browser session. It is deleted when you "
+               f"click *Clear my data*, when the session ends, or after {STALE_HOURS} h idle.")
 
 info = st.session_state.get("main_info")
 if not info or not table_exists("data"):
@@ -592,7 +660,7 @@ except Exception as e:  # noqa: BLE001
     con().execute("CREATE OR REPLACE VIEW filtered AS SELECT * FROM data")
     where, filtered_rows = "", info["rows"]
 
-st.session_state["cache_token"] = f"{get_engine()['version']}|{where}"
+st.session_state["cache_token"] = f"{get_engine().sid}|{get_engine().version}|{where}"
 total_rows = con().execute("SELECT COUNT(*) FROM data").fetchone()[0]
 
 # Header
