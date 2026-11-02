@@ -1,0 +1,26 @@
+[server]
+maxUploadSize = 100000
+maxMessageSize = 2000
+
+[client]
+toolbarMode = "viewer"
+
+[theme.light]
+primaryColor = "#5B4BDB"
+backgroundColor = "#F6F7FB"
+secondaryBackgroundColor = "#ECEEF8"
+textColor = "#1F2340"
+
+[theme.light.sidebar]
+backgroundColor = "#ECEAFB"
+secondaryBackgroundColor = "#FFFFFF"
+
+[theme.dark]
+primaryColor = "#8B7CF6"
+backgroundColor = "#0F1020"
+secondaryBackgroundColor = "#1D1E36"
+textColor = "#E7E7F7"
+
+[theme.dark.sidebar]
+backgroundColor = "#17182D"
+secondaryBackgroundColor = "#24264A"
